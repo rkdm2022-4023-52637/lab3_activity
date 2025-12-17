@@ -1,0 +1,790 @@
+import webview
+import numpy as np
+import json
+import traceback
+import pandas as pd
+from io import StringIO
+from fpdf import FPDF 
+
+# ==========================================
+# CALCULATION
+# ==========================================
+
+PQ = 0
+PV = 2
+SLACK = 3
+
+# =========================
+# YBUS
+# =========================
+def build_ybus(line_df, bus_ids):
+    n = len(bus_ids)
+    idx = {bus:i for i,bus in enumerate(bus_ids)}
+    Y = np.zeros((n,n), dtype=complex)
+
+    for _, r in line_df.iterrows():
+        i = idx[r['From']]
+        j = idx[r['To']]
+
+        z = r['R(pu)'] + 1j*r['X(pu)']
+        y = 1/z
+        b = 1j * r['B(pu)'] / 2 
+
+        Y[i,i] += y + b
+        Y[j,j] += y + b
+        Y[i,j] -= y
+        Y[j,i] -= y
+
+    return Y
+
+
+
+# =========================
+# GAUSS–SEIDEL 
+# =========================
+def gauss_seidel(Y, bus_type, Psp, Qsp, V0,
+                 tol=1e-6, max_iter=100):
+
+    n = len(Psp)
+    V = V0.astype(complex).copy()
+
+    for it in range(max_iter):
+        V_old = V.copy()
+
+        for i in range(n):
+            if bus_type[i] == SLACK:
+                continue
+
+            sumYV = 0+0j
+            for j in range(n):
+                if j != i:
+                    sumYV += Y[i, j] * V[j]
+
+            # PQ bus
+            if bus_type[i] == PQ:
+                V[i] = (1 / Y[i, i]) * (
+                    (Psp[i] - 1j*Qsp[i]) / np.conj(V[i]) - sumYV
+                )
+
+            # PV bus
+            elif bus_type[i] == PV:
+                # compute Q
+                Qsp[i] = -np.imag(np.conj(V[i]) * (
+                    Y[i, i]*V[i] + sumYV
+                ))
+
+                V_temp = (1 / Y[i, i]) * (
+                    (Psp[i] - 1j*Qsp[i]) / np.conj(V[i]) - sumYV
+                )
+
+                # enforce voltage magnitude
+                V[i] = np.abs(V0[i]) * np.exp(1j*np.angle(V_temp))
+
+        if np.max(np.abs(V - V_old)) < tol:
+            print(f"GS converged in {it+1} iterations")
+            break
+    else:
+        print("GS did not converge")
+
+    # Compute final P, Q
+    P = np.zeros(n)
+    Q = np.zeros(n)
+    for i in range(n):
+        S = V[i] * np.conj(np.dot(Y[i], V))
+        P[i] = np.real(S)
+        Q[i] = np.imag(S)
+
+    return V, P, Q
+
+
+# =========================
+# NEWTON-RAPHSON 
+# =========================
+
+def newton_raphson(Y, bus_type, Psp, Qsp, V0,
+                   tol=1e-6, max_iter=20):
+
+    n = len(Psp)
+    G, B = Y.real, Y.imag
+
+    V = np.abs(V0).copy()
+    d = np.angle(V0).copy()
+
+    # bus sets
+    slack = [i for i in range(n) if bus_type[i] == SLACK]
+    pv = [i for i in range(n) if bus_type[i] == PV]
+    pq = [i for i in range(n) if bus_type[i] == PQ]
+
+    # Angles for all non-slack buses
+    ang = pv + pq
+
+    for _ in range(max_iter):
+        P = np.zeros(n)
+        Q = np.zeros(n)
+
+        for i in range(n):
+            for j in range(n):
+                P[i] += V[i]*V[j]*(G[i,j]*np.cos(d[i]-d[j]) +
+                                   B[i,j]*np.sin(d[i]-d[j]))
+                Q[i] += V[i]*V[j]*(G[i,j]*np.sin(d[i]-d[j]) -
+                                   B[i,j]*np.cos(d[i]-d[j]))
+
+        
+        dP = [Psp[i] - P[i] for i in ang]
+        dQ = [Qsp[i] - Q[i] for i in pq]
+        mismatch = np.array(dP + dQ)
+
+        if np.max(np.abs(mismatch)) < tol:
+            break
+
+        m = len(ang)
+        k = len(pq)
+        J = np.zeros((m+k, m+k))
+
+        # J11 dP/dδ
+        for a,i in enumerate(ang):
+            for b,j in enumerate(ang):
+                if i == j:
+                    J[a,b] = -Q[i] - B[i,i]*V[i]**2
+                else:
+                    J[a,b] = V[i]*V[j]*(G[i,j]*np.sin(d[i]-d[j]) -
+                                        B[i,j]*np.cos(d[i]-d[j]))
+
+        # J12 dP/dV
+        for a,i in enumerate(ang):
+            for b,j in enumerate(pq):
+                if i == j:
+                    J[a,m+b] = P[i]/V[i] + G[i,i]*V[i]
+                else:
+                    J[a,m+b] = V[i]*(G[i,j]*np.cos(d[i]-d[j]) +
+                                     B[i,j]*np.sin(d[i]-d[j]))
+
+        # J21 dQ/dδ
+        for a,i in enumerate(pq):
+            for b,j in enumerate(ang):
+                if i == j:
+                    J[m+a,b] = P[i] - G[i,i]*V[i]**2
+                else:
+                    J[m+a,b] = -V[i]*V[j]*(G[i,j]*np.cos(d[i]-d[j]) +
+                                           B[i,j]*np.sin(d[i]-d[j]))
+
+        # J22 dQ/dV
+        for a,i in enumerate(pq):
+            for b,j in enumerate(pq):
+                if i == j:
+                    J[m+a,m+b] = Q[i]/V[i] - B[i,i]*V[i]
+                else:
+                    J[m+a,m+b] = V[i]*(G[i,j]*np.sin(d[i]-d[j]) -
+                                       B[i,j]*np.cos(d[i]-d[j]))
+
+        dx = np.linalg.solve(J, mismatch)
+
+        d[ang] += dx[:m]
+        V[pq] += dx[m:]
+
+    return V*np.exp(1j*d), P, Q
+
+
+
+# ==========================================
+# API
+# ==========================================
+
+class LoadFlowApi:
+    def __init__(self):
+        self.branch_data = []
+        self.bus_data = []
+        self.base_mva = 100.0
+        self.base_kv = 230.0
+        self.iteration_mode = 100
+        self.tolerance = 0.000001
+        self.last_results_df = None
+
+    def set_base_params(self, mva, kv, Iteration, Tolerance):
+        self.base_mva = float(mva)
+        self.base_kv = float(kv)
+        self.iteration_mode = float (Iteration)
+        self.tolerance = float (Tolerance)
+        return "Updated"
+
+    def _process_results(self, sorted_ids, V_res, P_res, Q_res):
+        results = []
+        for i, bid in enumerate(sorted_ids):
+            v_mag = abs(V_res[i])
+            v_ang = np.degrees(np.angle(V_res[i]))
+            
+            # Use PU values directly
+            p_pu = P_res[i]
+            q_pu = Q_res[i]
+            v_kv = v_mag * self.base_kv
+
+            results.append({
+                'Bus': bid, 
+                'V (pu)': round(v_mag, 4),
+                'Angle (deg)': round(v_ang, 4),
+                'V (kV)': round(v_kv, 4),
+                'P (pu)': round(p_pu, 4),
+                'Q (pu)': round(q_pu, 4)
+            })
+        
+        df = pd.DataFrame(results)
+        self.last_results_df = df
+        
+        output = StringIO()
+        output.write(f"Base MVA: {self.base_mva}\nBase kV: {self.base_kv}\n")
+        output.write("-" * 40 + "\n")
+        
+        # Simplified output for the sidebar
+        for _, row in df.iterrows():
+            output.write(f"Bus {int(row['Bus'])}: {row['V (pu)']:.4f}∠{row['Angle (deg)']:.2f}°\n")
+            output.write(f"       P: {row['P (pu)']:.4f}pu Q: {row['Q (pu)']:.4f}pu\n")
+            output.write("-" * 25 + "\n")
+        return output.getvalue()
+
+    def run_calculation(self, mode, branch_json, bus_json):
+        try:
+            branches = json.loads(branch_json)
+            buses = json.loads(bus_json)
+            
+            bus_ids = set()
+            for b in buses: bus_ids.add(int(b['id']))
+            for br in branches: 
+                bus_ids.add(int(br['from']))
+                bus_ids.add(int(br['to']))
+            
+            sorted_ids = sorted(list(bus_ids))
+            n = len(sorted_ids)
+
+            line_df = pd.DataFrame(branches)
+            if not line_df.empty:
+                line_df = line_df.rename(columns={
+                    'from': 'From', 'to': 'To', 
+                    'r': 'R(pu)', 'x': 'X(pu)', 'b': 'B(pu)'
+                })
+                line_df['From'] = line_df['From'].astype(int)
+                line_df['To'] = line_df['To'].astype(int)
+                line_df[['R(pu)', 'X(pu)', 'B(pu)']] = line_df[['R(pu)', 'X(pu)', 'B(pu)']].astype(float)
+            else:
+                line_df = pd.DataFrame(columns=['From', 'To', 'R(pu)', 'X(pu)', 'B(pu)'])
+
+            Y = build_ybus(line_df, sorted_ids)
+            idx_map = {bus: i for i, bus in enumerate(sorted_ids)}
+
+            if mode == "ybus":
+                output = "Y-BUS Matrix:\n" + "="*20 + "\n"
+                for i in range(n):
+                    for j in range(n):
+                        if abs(Y[i,j]) > 1e-9:
+                            val = Y[i,j]
+                            output += f"Y[{sorted_ids[i]},{sorted_ids[j]}]:\n {val.real:.4f}{val.imag:+.4f}j\n"
+                    output += "-"*20 + "\n"
+                
+                ybus_data = {'Bus': sorted_ids}
+                for j in range(n):
+                    ybus_data[f'Y{sorted_ids[j]}'] = [f"{Y[i,j].real:.4f}+{Y[i,j].imag:.4f}j" for i in range(n)]
+                self.last_results_df = pd.DataFrame(ybus_data)
+                return output
+
+            type_vec, P, Q, V = np.zeros(n, int), np.zeros(n), np.zeros(n), np.zeros(n, complex)
+            for i in range(n): type_vec[i], V[i] = PQ, 1.0 + 0j
+            
+            for b in buses:
+                if int(b['id']) in idx_map:
+                    i = idx_map[int(b['id'])]
+                    t = str(b['type'])
+                    if t == 'Slack': type_vec[i] = SLACK
+                    elif t == 'PV': type_vec[i] = PV
+                    else: type_vec[i] = PQ
+                    
+                    vm, va = float(b['v']), float(b['ang'])
+                    # Use PU directly 
+                    P[i], Q[i] = float(b['p']), float(b['q']) 
+                    
+                    V[i] = vm * np.exp(1j * np.deg2rad(va))
+
+            if mode == "newton":
+                V_res, P_res, Q_res = newton_raphson(Y, type_vec, P, Q, V)
+                title = "Newton-Raphson"
+            else:
+                V_res, P_res, Q_res = gauss_seidel(Y, type_vec, P, Q, V)
+                title = "Gauss-Seidel"
+
+            return f"{title}\n" + self._process_results(sorted_ids, V_res, P_res, Q_res)
+
+        except Exception as e:
+            self.last_results_df = None
+            return f"Error: {str(e)}\n{traceback.format_exc()}"
+
+    def open_popup_results(self, content):
+        html_content = f"""
+        <html>
+        <head>
+            <title>Results</title>
+            <style>
+                body {{ font-family: 'Consolas', monospace; padding: 20px; background: #fdfdfd; }}
+                pre {{ white-space: pre-wrap; font-size: 14px; color: #333; }}
+                h2 {{ font-family: 'Segoe UI', sans-serif; border-bottom: 2px solid #0078D7; padding-bottom: 10px; color: #0078D7; }}
+            </style>
+        </head>
+        <body>
+            <h2>Calculation Results</h2>
+            <pre>{content}</pre>
+        </body>
+        </html>
+        """
+        webview.create_window('Detailed Results View', html=html_content, width=600, height=800)
+
+    def import_file(self):
+        file_types = ('Excel Files (*.xlsx;*.xls)', 'All files (*.*)')
+        result = webview.windows[0].create_file_dialog(webview.OPEN_DIALOG, file_types=file_types)
+        if not result: return "cancelled"
+        
+        try:
+            df = pd.read_excel(result[0])
+            df.columns = df.columns.str.strip() 
+            branches, buses = [], []
+            
+            req_line = ['From', 'To', 'R(pu)', 'X(pu)', 'B(pu)']
+            if all(c in df.columns for c in req_line):
+                ldf = df[req_line].dropna()
+                for _, r in ldf.iterrows():
+                    branches.append({'from':int(r['From']),'to':int(r['To']),'r':float(r['R(pu)']),'x':float(r['X(pu)']),'b':float(r['B(pu)']/2)})
+            
+            req_bus = ['Bus no.', 'P', 'Q', 'V', 'δ']
+            if all(c in df.columns for c in req_bus):
+                bdf = df[req_bus].dropna(subset=['Bus no.'])
+                for _, r in bdf.iterrows():
+                    bt = 'Slack' if int(r['Bus no.'])==1 else ('PV' if not pd.isna(r['V']) and pd.isna(r['Q']) else 'PQ')
+                    buses.append({'id':int(r['Bus no.']),'type':bt,'v':float(r['V']) if not pd.isna(r['V']) else 1.0,'ang':float(r['δ']) if not pd.isna(r['δ']) else 0.0,'p':float(r['P']) if not pd.isna(r['P']) else 0.0,'q':float(r['Q']) if not pd.isna(r['Q']) else 0.0})
+
+            return json.dumps({'buses':buses,'branches':branches})
+        except Exception as e: return f"error:{str(e)}"
+
+    def export_results(self, format_type):
+        if self.last_results_df is None: return "error:No results."
+        window = webview.windows[0]
+        ext = format_type if format_type != 'excel' else 'xlsx'
+        path = window.create_file_dialog(webview.SAVE_DIALOG, save_filename=f'results.{ext}')
+        if not path: return "cancelled"
+        
+        try:
+            if format_type=='csv': self.last_results_df.to_csv(path[0], index=False)
+            elif format_type in ['xls','xlsx']: self.last_results_df.to_excel(path[0], index=False)
+            elif format_type=='pdf':
+                #A4 Landscape format
+                pdf = FPDF(orientation='L', unit='mm', format='A4')
+                pdf.set_auto_page_break(auto=True, margin=15)
+
+                df = self.last_results_df.copy()
+                all_cols = list(df.columns)
+
+                max_cols = 7
+                max_rows = 40
+
+                total_rows = len(df)
+                total_cols = len(all_cols)
+
+                usable_w = pdf.w - pdf.l_margin - pdf.r_margin
+                col_w = usable_w / max_cols
+
+                font_size = 10 if col_w >= 25 else max(6, int(10 * (col_w / 25)))
+
+                for col_start in range(0, total_cols, max_cols):
+                    cols = all_cols[col_start:col_start + max_cols]
+
+                    for row_start in range(0, total_rows, max_rows):
+                        pdf.add_page()
+
+                        # ---- Title ----
+                        pdf.set_font("Arial", 'B', 12)
+                        pdf.cell(0, 10, "Results", ln=1, align='C')
+
+                        # ---- Column range info  ----
+                        pdf.set_font("Arial", '', 9)
+                        pdf.cell(
+                            0, 6,
+                            f"Columns {col_start+1}-{min(col_start+len(cols), total_cols)} | "
+                            f"Rows {row_start+1}-{min(row_start+max_rows, total_rows)}",
+                            ln=1, align='C'
+                        )
+
+                        # ---- Header ----
+                        pdf.set_font("Arial", 'B', font_size)
+                        for c in cols:
+                            pdf.cell(col_w, 8, str(c), border=1, align='C')
+                        pdf.ln()
+
+                        # ---- Rows ----
+                        pdf.set_font("Arial", '', font_size)
+                        page_rows = df.iloc[row_start:row_start + max_rows]
+
+                        for _, row in page_rows.iterrows():
+                            for c in cols:
+                                val = row[c]
+                                s = '' if pd.isna(val) else str(val)
+                                if len(s) > 80:
+                                    s = s[:77] + '...'
+                                pdf.cell(col_w, 7, s, border=1, align='C')
+                            pdf.ln()
+
+
+                pdf.output(path[0])
+            return "Exported."
+        except Exception as e: return f"error:{str(e)}"
+
+# ==========================================
+# HTML UI
+# ==========================================
+
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+    :root {
+        --primary: #0078D7;
+        --sidebar-bg: #f3f3f3;
+        --border: #cccccc;
+    }
+    body {
+        font-family: 'Segoe UI', sans-serif;
+        margin: 0; padding: 0;
+        display: flex;
+        height: 100vh;
+        overflow: hidden;
+    }
+    
+    .sidebar {
+        width: 320px; 
+        background: var(--sidebar-bg);
+        border-right: 1px solid var(--border);
+        display: flex;
+        flex-direction: column;
+        padding: 15px;
+        gap: 10px;
+        box-sizing: border-box;
+        height: 100vh; 
+    }
+    
+    .section-title {
+        font-size: 11px;
+        font-weight: bold;
+        color: #666;
+        text-transform: uppercase;
+        margin-bottom: 5px;
+        letter-spacing: 0.5px;
+    }
+    
+    .btn {
+        width: 100%;
+        padding: 8px;
+        border: 1px solid #aaa;
+        background: white;
+        cursor: pointer;
+        text-align: left;
+        margin-bottom: 4px;
+        border-radius: 4px;
+        font-size: 13px;
+    }
+    .btn:hover { background: #e5f1fb; border-color: var(--primary); }
+    .btn.active { background: var(--primary); color: white; border-color: var(--primary); font-weight: bold; }
+    
+    .input-group { margin-bottom: 8px; }
+    .input-group label { display: block; font-size: 12px; margin-bottom: 2px; }
+    .input-control {
+        width: 100%; padding: 5px;
+        border: 1px solid #aaa; border-radius: 3px;
+        box-sizing: border-box; font-size: 13px;
+    }
+
+    .results-wrapper {
+        display: flex;
+        flex-direction: column;
+        flex: 1; 
+        min-height: 0; 
+        border-top: 2px solid #ddd;
+        padding-top: 10px;
+        transition: flex 0.3s ease;
+    }
+
+    .results-header-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 5px;
+    }
+
+    .ctrl-btn {
+        background: none; border: 1px solid #aaa;
+        cursor: pointer; font-weight: bold; color: #555;
+        border-radius: 3px; width: 20px; height: 20px;
+        font-size: 10px; padding: 0; line-height: 18px;
+    }
+    .ctrl-btn:hover { background: #ddd; color: black; }
+    
+    .results-text {
+        flex: 1; 
+        background: white;
+        border: 1px solid #ccc;
+        font-family: 'Consolas', monospace;
+        font-size: 11px;
+        padding: 8px;
+        overflow-y: auto; 
+        white-space: pre-wrap;
+        margin-bottom: 5px;
+    }
+
+    .export-buttons { display: flex; gap: 2px; }
+    .export-buttons .btn { 
+        text-align: center; padding: 4px; font-size: 11px; margin: 0;
+    }
+    
+    .main {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        background: white;
+        padding: 20px;
+        height: 100vh;
+        box-sizing: border-box;
+    }
+    
+    .header {
+        font-size: 20px; font-weight: 300; color: var(--primary);
+        margin-bottom: 15px; border-bottom: 1px solid #eee; padding-bottom: 5px;
+    }
+    
+    .tables-container {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 15px;
+        overflow: hidden; 
+    }
+
+    .input-area {
+        flex: 1; 
+        overflow: auto;
+        border: 1px solid var(--border);
+        background: #fafafa;
+        position: relative;
+    }
+    
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { background: #eee; text-align: left; padding: 6px; position: sticky; top: 0; z-index: 10; font-size: 12px; }
+    td { border-bottom: 1px solid #ddd; padding: 2px; background: white; }
+    input.cell, select.cell { border: none; width: 100%; padding: 4px; font-family: inherit; box-sizing: border-box; }
+    input.cell:focus, select.cell:focus { background: #eef; }
+    
+    .hidden { display: none !important; }
+    .btn-sm { padding: 2px 6px; font-size: 11px; width: auto; position: absolute; bottom: 5px; right: 5px; z-index: 20; opacity: 0.8; }
+    
+</style>
+</head>
+<body>
+
+<div class="sidebar">
+    <div>
+        <button class="btn" style="font-weight:bold; text-align:center" onclick="importFile()">📂 Import Excel Data</button>
+    </div>
+
+    <div>
+        <div class="section-title">Method</div>
+        <button class="btn active" id="btn-ybus" onclick="setMode('ybus')">Y-Bus & Z-Bus</button>
+        <button class="btn" id="btn-gauss" onclick="setMode('gauss')">Gauss-Seidel</button>
+        <button class="btn" id="btn-newton" onclick="setMode('newton')">Newton-Raphson</button>
+    </div>
+    
+    <div>
+        <div class="section-title">System Base</div>
+        <div style="display:flex; gap:5px">
+
+            <div class="input-group" style="flex:1">
+                <label>MVA</label>
+                <input type="number" id="base_mva" value="100" class="input-control">
+            </div>
+
+            <div class="input-group" style="flex:1">
+                <label>kV</label>
+                <input type="number" id="base_kv" value="230" class="input-control">
+            </div>
+
+            <div class="input-group" style="flex:1">
+                <label>Iterations</label> 
+                <input type="number" id="iteration_mode" value="100" class="input-control">
+            </div>
+
+            <div class="input-group" style="flex:1.3">
+                <label>Tolerance</label> 
+                <input type="number" id="tolerance" value="0.000001" step="0.0000001" class="input-control">
+            </div>
+        </div>
+    </div>
+    
+    <button class="btn" style="background:#0078d4; color:white; font-weight: bold; text-align:center; margin-top:5px;" onclick="calculate()">▶ CALCULATE</button>
+    
+    <div class="results-wrapper" id="res-wrapper">
+        <div class="results-header-row">
+            <div class="section-title" style="margin:0">Results</div>
+            <div>
+                <button class="ctrl-btn" onclick="toggleResults()" title="Minimize/Maximize">_</button>
+                <button class="ctrl-btn" onclick="popOutResults()" title="Open in New Window">🗖</button>
+            </div>
+        </div>
+
+        <div id="results-content-box" style="display:flex; flex-direction:column; flex:1; min-height:0;">
+            <div id="results" class="results-text">Ready...</div>
+            
+            <div class="section-title" style="margin-top:5px">Export</div>
+            <div class="export-buttons">
+                <button class="btn" onclick="exportResults('pdf')">PDF</button>
+                <button class="btn" onclick="exportResults('csv')">CSV</button>
+                <button class="btn" onclick="exportResults('xlsx')">XLSX</button>
+            </div>
+            <div style="margin-top:5px; text-align:right">
+                 <button class="btn" style="width:auto; font-size:10px; padding:2px 5px; color:red" onclick="clearAll()">Clear All</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="main">
+    <div class="header">⚡PyFlow</div>
+    
+
+    <div class="tables-container">
+        <div class="input-area" id="area-branch">
+            <div style="padding:5px; font-weight:bold; background:#eee; font-size:12px; border-bottom:1px solid #ccc">BRANCH DATA (Lines)</div>
+            <table id="tbl-branch">
+                <thead><tr><th>From</th><th>To</th><th>R(pu)</th><th>X(pu)</th><th>B(pu)</th></tr></thead>
+                <tbody></tbody>
+            </table>
+            <button class="btn btn-sm" onclick="addBranchRow()">+ Row</button>
+        </div>
+
+        <div class="input-area hidden" id="area-bus">
+            <div style="padding:5px; font-weight:bold; background:#eee; font-size:12px; border-bottom:1px solid #ccc">BUS DATA</div>
+            <table id="tbl-bus">
+                <thead><tr><th>Bus No.</th><th>Type</th><th>V(pu)</th><th>Ang</th><th>P(pu)</th><th>Q(pu)</th></tr></thead>
+                <tbody></tbody>
+            </table>
+            <button class="btn btn-sm" onclick="addBusRow()">+ Row</button>
+        </div>
+    </div>
+</div>
+
+<script>
+    let currentMode = 'ybus';
+    let isMinimized = false;
+    
+    function setMode(mode) {
+        currentMode = mode;
+        document.querySelectorAll('.sidebar .btn').forEach(b => b.classList.remove('active'));
+        document.getElementById('btn-'+mode).classList.add('active');
+        
+        if(mode === 'ybus') {
+            document.getElementById('area-bus').classList.add('hidden');
+            document.getElementById('area-branch').style.height = "100%";
+        } else {
+            document.getElementById('area-bus').classList.remove('hidden');
+            document.getElementById('area-branch').style.height = "50%";
+        }
+    }
+
+    function toggleResults() {
+        const box = document.getElementById('results-content-box');
+        const wrapper = document.getElementById('res-wrapper');
+        
+        if (!isMinimized) {
+            box.style.display = 'none';
+            wrapper.style.flex = '0 0 auto'; // Shrink to fit header only
+            isMinimized = true;
+        } else {
+            box.style.display = 'flex';
+            wrapper.style.flex = '1'; // Grow to fill space
+            isMinimized = false;
+        }
+    }
+
+    function popOutResults() {
+        const content = document.getElementById('results').innerText;
+        pywebview.api.open_popup_results(content);
+    }
+
+    function addBranchRow(f='', t='', r='', x='', b='') {
+        const tbody = document.querySelector('#tbl-branch tbody');
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td><input class="cell" type="number" value="${f}"></td><td><input class="cell" type="number" value="${t}"></td><td><input class="cell" type="number" value="${r}"></td><td><input class="cell" type="number" value="${x}"></td><td><input class="cell" type="number" value="${b}"></td>`;
+        tbody.appendChild(tr);
+    }
+    
+    function addBusRow(id='', type='PQ', v='1.0', ang='0', p='0', q='0') {
+        const tbody = document.querySelector('#tbl-bus tbody');
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td><input class="cell" type="number" value="${id}"></td><td><select class="cell"><option ${type==='Slack'?'selected':''}>Slack</option><option ${type==='PV'?'selected':''}>PV</option><option ${type==='PQ'?'selected':''}>PQ</option></select></td><td><input class="cell" type="number" value="${v}"></td><td><input class="cell" type="number" value="${ang}"></td><td><input class="cell" type="number" value="${p}"></td><td><input class="cell" type="number" value="${q}"></td>`;
+        tbody.appendChild(tr);
+    }
+    
+    function getBranchData() {
+        const rows = [];
+        document.querySelectorAll('#tbl-branch tbody tr').forEach(tr => {
+            const i = tr.querySelectorAll('input');
+            if(i[0].value) rows.push({from:i[0].value, to:i[1].value, r:i[2].value, x:i[3].value, b:i[4].value});
+        });
+        return rows;
+    }
+    
+    function getBusData() {
+        const rows = [];
+        document.querySelectorAll('#tbl-bus tbody tr').forEach(tr => {
+            const i = tr.querySelectorAll('input');
+            if(i[0].value) rows.push({id:i[0].value, type:tr.querySelector('select').value, v:i[1].value, ang:i[2].value, p:i[3].value, q:i[4].value});
+        });
+        return rows;
+    }
+
+    function calculate() {
+        pywebview.api.set_base_params(document.getElementById('base_mva').value, document.getElementById('base_kv').value);
+        document.getElementById('results').innerText = "Calculating...";
+        
+        if(isMinimized) toggleResults();
+
+        pywebview.api.run_calculation(currentMode, JSON.stringify(getBranchData()), JSON.stringify(getBusData()))
+            .then(res => document.getElementById('results').innerText = res);
+    }
+    
+    function clearAll() {
+        document.querySelector('#tbl-branch tbody').innerHTML = '';
+        document.querySelector('#tbl-bus tbody').innerHTML = '';
+        for(let i=0; i<5; i++) { addBranchRow(); addBusRow(); }
+        document.getElementById('results').innerText = '';
+    }
+    
+    function importFile() {
+        pywebview.api.import_file().then(res => {
+            if(res=='cancelled' || res.startsWith('error')) { if(res.startsWith('error')) alert(res); return; }
+            const d = JSON.parse(res);
+            document.querySelector('#tbl-branch tbody').innerHTML = '';
+            document.querySelector('#tbl-bus tbody').innerHTML = '';
+            (d.branches||[]).forEach(b=>addBranchRow(b.from,b.to,b.r,b.x,b.b));
+            (d.buses||[]).forEach(b=>addBusRow(b.id,b.type,b.v,b.ang,b.p,b.q));
+            document.getElementById('results').innerText = "Imported.";
+        });
+    }
+
+    function exportResults(fmt) {
+        pywebview.api.export_results(fmt).then(r => { if(!r.startsWith('error') && r!='cancelled') alert(r); });
+    }
+
+    // Init
+    for(let i=0; i<5; i++) { addBranchRow(); addBusRow(); }
+    setMode('ybus');
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    api = LoadFlowApi()
+    webview.create_window("⚡PyFlow", html=HTML, js_api=api, width=1100, height=750)
+    webview.start()
