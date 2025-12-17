@@ -1,0 +1,114 @@
+import numpy as np
+
+# Constants
+PQ = 0
+PV = 2
+SLACK = 3
+
+def build_ybus(line_df, bus_ids):
+    """
+    Build Y-bus matrix from branch data.
+    """
+    n = len(bus_ids)
+    idx = {bus: i for i, bus in enumerate(bus_ids)}
+    Y = np.zeros((n, n), dtype=complex)
+
+    for _, r in line_df.iterrows():
+        i, j = idx[r['From']], idx[r['To']]
+        z = r['R(pu)'] + 1j * r['X(pu)']
+        y, b = 1 / z, 1j * r['B(pu)'] / 2
+
+        Y[i, i] += y + b
+        Y[j, j] += y + b
+        Y[i, j] -= y
+        Y[j, i] -= y
+
+    return Y
+
+
+def gauss_seidel(Y, bus_type, Psp, Qsp, V0, tol=1e-6, max_iter=100):
+    """
+    Perform load flow using Gauss-Seidel method.
+    """
+    n = len(Psp)
+    V = V0.astype(complex).copy()
+
+    for it in range(max_iter):
+        V_old = V.copy()
+
+        for i in range(n):
+            if bus_type[i] == SLACK:
+                continue
+
+            sumYV = sum(Y[i, j] * V[j] for j in range(n) if j != i)
+
+            if bus_type[i] == PQ:
+                V[i] = (1 / Y[i, i]) * ((Psp[i] - 1j * Qsp[i]) / np.conj(V[i]) - sumYV)
+            elif bus_type[i] == PV:
+                Qsp[i] = -np.imag(np.conj(V[i]) * (Y[i, i] * V[i] + sumYV))
+                V_temp = (1 / Y[i, i]) * ((Psp[i] - 1j * Qsp[i]) / np.conj(V[i]) - sumYV)
+                V[i] = np.abs(V0[i]) * np.exp(1j * np.angle(V_temp))
+
+        if np.max(np.abs(V - V_old)) < tol:
+            print(f"Gauss-Seidel converged in {it + 1} iterations")
+            break
+    else:
+        print("GS did not converge")
+
+    return V
+
+
+class LoadFlow:
+    """
+    Simple Load Flow Solver.
+    """
+
+    @staticmethod
+    def run(branch_json, bus_json):
+        import pandas as pd
+        import json
+        
+        line_data = []
+        for branch in branch_json:
+            line_data.append({
+                'From': int(branch['from']),
+                'To': int(branch['to']),
+                'R(pu)': float(branch['r']),
+                'X(pu)': float(branch['x']),
+                'B(pu)': float(branch['b'] / 2),
+            })
+        
+        buses = bus_json
+        bus_ids = sorted({bus['id'] for bus in buses})
+        n = len(bus_ids)
+
+        # Bus properties
+        P, Q = np.zeros(n), np.zeros(n)
+        V = np.ones(n, dtype=complex)
+        type_vec = np.zeros(n, dtype=int)
+
+        for bus in buses:
+            i = bus_ids.index(bus['id'])
+            type_vec[i] = PQ if bus['type'] == "PQ" else PV if bus['type'] == "PV" else SLACK
+            P[i], Q[i] = bus.get('p', 0), bus.get('q', 0)
+            V[i] = bus.get('v', 1) * np.exp(1j * np.radians(bus.get('ang', 0)))
+
+        line_df = pd.DataFrame(line_data)
+        Y = build_ybus(line_df, bus_ids)
+        V_result = gauss_seidel(Y, type_vec, P, Q, V)
+        return V_result
+
+
+# Example Run
+if __name__ == "__main__":
+    branches = [
+        {"from": 1, "to": 2, "r": 0.02, "x": 0.04, "b": 0.006},
+        {"from": 1, "to": 3, "r": 0.01, "x": 0.03, "b": 0.003},
+    ]
+    buses = [
+        {"id": 1, "type": "Slack", "v": 1.0, "ang": 0, "p": 0, "q": 0},
+        {"id": 2, "type": "PQ", "p": 1.5, "q": 0.5},
+        {"id": 3, "type": "PV", "v": 1.02, "p": 2.0},
+    ]
+    result = LoadFlow.run(branches, buses)
+    print("Voltage Results:", result)
